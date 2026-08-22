@@ -37,6 +37,50 @@ class ProviderError(Exception):
     pass
 
 
+def _classify_http_error(name: str, status_code: int, body: str) -> str:
+    """
+    Turns a raw HTTP status code into a plain-language explanation,
+    so errors say what's actually wrong instead of just a number.
+    """
+    if status_code == 401:
+        return (
+            f"{name} says this API key is invalid (401 Unauthorized). "
+            f"Double-check you copied the whole key with no extra spaces, "
+            f"or generate a new one from {name}'s website and paste that in."
+        )
+    if status_code == 402:
+        return (
+            f"{name} is asking for payment (402 Payment Required). "
+            f"This usually means the free tier needs a billing method on "
+            f"file, or your free credits ran out. Try a different provider, "
+            f"or add billing on {name}'s site if you want to keep using it."
+        )
+    if status_code == 403:
+        return (
+            f"{name} refused this request (403 Forbidden). Your key may "
+            f"not have permission for this, or your account may need "
+            f"extra verification on {name}'s site."
+        )
+    if status_code == 404:
+        return f"{name} error: the model name this app is using no longer exists (404). This is a bug in the app, not something you did — let me know."
+    if status_code >= 500:
+        return f"{name}'s own servers are having trouble right now (error {status_code}). This isn't your key or your computer - try again shortly."
+    return f"{name} error {status_code}: {body[:200]}"
+
+
+def _classify_network_error(name: str, exc: Exception) -> str:
+    """Turns a raw network exception into a plain-language explanation."""
+    if isinstance(exc, requests.exceptions.Timeout):
+        return f"{name} didn't respond in time. This is usually a slow or unstable internet connection - try again."
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return (
+            f"Couldn't reach {name} at all. This usually means no internet "
+            f"connection right now, or a firewall/antivirus blocking this "
+            f"app's network access. Check your connection and try again."
+        )
+    return f"Unexpected network error reaching {name}: {exc}"
+
+
 # ---------------------------------------------------------------------
 # Most providers (Groq, OpenRouter, Mistral, Cerebras) all speak the
 # same "OpenAI-compatible" chat completions format, so one class can
@@ -44,12 +88,22 @@ class ProviderError(Exception):
 # ---------------------------------------------------------------------
 
 class OpenAICompatibleProvider:
-    def __init__(self, name, url, default_model, env_var, api_key=None, extra_headers=None):
+    def __init__(self, name, url, models, env_var, api_key=None, extra_headers=None):
+        """
+        models: a list of model name candidates, tried in order. Free
+        model names on these providers get renamed, deprecated, or
+        delisted with little notice - if the first one 404s (model
+        not found), this automatically tries the next one instead of
+        just failing, so a single upstream rename doesn't break the
+        whole provider. The model that works is remembered so later
+        calls go straight to it instead of re-testing each time.
+        """
         self.name = name
         self.url = url
-        self.model = default_model
+        self.models = models if isinstance(models, list) else [models]
         self.api_key = api_key or os.environ.get(env_var)
         self.extra_headers = extra_headers or {}
+        self._working_model_index = 0
 
     def available(self) -> bool:
         return bool(self.api_key)
@@ -76,58 +130,83 @@ class OpenAICompatibleProvider:
             for t in tools
         ]
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "tools": openai_tools,
-            "tool_choice": "auto",
-        }
+        last_error = None
+        # Start from the model that last worked, so a provider that's
+        # already found a good model doesn't retry older ones every call.
+        ordered_indices = list(range(self._working_model_index, len(self.models))) + \
+                           list(range(0, self._working_model_index))
 
-        response = requests.post(self.url, headers=headers, json=payload, timeout=90)
+        for idx in ordered_indices:
+            model_name = self.models[idx]
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "tools": openai_tools,
+                "tool_choice": "auto",
+            }
 
-        if response.status_code == 429:
-            raise RateLimitError(f"{self.name} rate limit hit.")
-        if response.status_code != 200:
-            raise ProviderError(f"{self.name} error {response.status_code}: {response.text}")
+            try:
+                response = requests.post(self.url, headers=headers, json=payload, timeout=90)
+            except requests.exceptions.RequestException as exc:
+                raise ProviderError(_classify_network_error(self.name, exc))
 
-        return response.json()
+            if response.status_code == 429:
+                raise RateLimitError(f"{self.name} rate limit hit.")
+
+            if response.status_code == 404:
+                # This specific model is gone - remember the error and
+                # try the next candidate instead of giving up outright.
+                last_error = ProviderError(_classify_http_error(self.name, 404, response.text))
+                continue
+
+            if response.status_code != 200:
+                raise ProviderError(_classify_http_error(self.name, response.status_code, response.text))
+
+            self._working_model_index = idx
+            return response.json()
+
+        raise last_error or ProviderError(f"{self.name}: no working model found.")
 
 
-def GroqProvider(model="llama-3.3-70b-versatile", api_key=None):
+def GroqProvider(models=None, api_key=None):
     return OpenAICompatibleProvider(
         name="Groq",
         url="https://api.groq.com/openai/v1/chat/completions",
-        default_model=model,
+        models=models or ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3-32b"],
         env_var="GROQ_API_KEY",
         api_key=api_key,
     )
 
 
-def OpenRouterProvider(model="meta-llama/llama-3.3-70b-instruct:free", api_key=None):
+def OpenRouterProvider(models=None, api_key=None):
     return OpenAICompatibleProvider(
         name="OpenRouter",
         url="https://openrouter.ai/api/v1/chat/completions",
-        default_model=model,
+        models=models or [
+            "openai/gpt-oss-120b:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "qwen/qwen3-coder:free",
+        ],
         env_var="OPENROUTER_API_KEY",
         api_key=api_key,
     )
 
 
-def MistralProvider(model="mistral-large-latest", api_key=None):
+def MistralProvider(models=None, api_key=None):
     return OpenAICompatibleProvider(
         name="Mistral",
         url="https://api.mistral.ai/v1/chat/completions",
-        default_model=model,
+        models=models or ["mistral-large-latest", "mistral-small-latest"],
         env_var="MISTRAL_API_KEY",
         api_key=api_key,
     )
 
 
-def CerebrasProvider(model="llama-3.3-70b", api_key=None):
+def CerebrasProvider(models=None, api_key=None):
     return OpenAICompatibleProvider(
         name="Cerebras",
         url="https://api.cerebras.ai/v1/chat/completions",
-        default_model=model,
+        models=models or ["llama-3.3-70b"],
         env_var="CEREBRAS_API_KEY",
         api_key=api_key,
     )

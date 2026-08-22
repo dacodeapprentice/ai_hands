@@ -9,10 +9,55 @@ this is the file where you'd add it.
 
 import os
 import subprocess
+import platform
 
 # Safety: every tool call is restricted to happen inside this folder.
 # The AI can never read/write/run anything outside of PROJECT_DIR.
 PROJECT_DIR = None
+
+
+class UnsafeProjectDirError(Exception):
+    """Raised when the chosen project folder is a system-critical location."""
+    pass
+
+
+def _is_dangerous_project_dir(path: str) -> bool:
+    """
+    Refuses to let the AI operate directly on OS-critical folders, or on
+    a drive/filesystem root. Confirmation popups protect individual
+    actions, but picking a system folder as the project itself would
+    put every file in it one approved instruction away from being
+    changed or deleted - this blocks that scenario outright, before
+    any instruction is even possible.
+    """
+    normalized = os.path.normcase(os.path.abspath(path))
+    drive, tail = os.path.splitdrive(normalized)
+
+    # Refuse any drive/filesystem root (C:\, D:\, /) - too broad to be a
+    # sensible "project", and likely to contain OS-critical folders.
+    if tail in ("", os.sep, "\\", "/"):
+        return True
+
+    system = platform.system()
+    if system == "Windows":
+        dangerous = [
+            os.environ.get("WINDIR", "C:\\Windows"),
+            os.environ.get("PROGRAMFILES", "C:\\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"),
+            os.environ.get("PROGRAMDATA", "C:\\ProgramData"),
+        ]
+    else:
+        dangerous = [
+            "/", "/bin", "/sbin", "/usr", "/etc", "/lib", "/lib64",
+            "/System", "/Library", "/private", "/boot", "/dev", "/proc",
+            "/sys", "/var",
+        ]
+
+    for d in dangerous:
+        d_norm = os.path.normcase(os.path.abspath(d))
+        if normalized == d_norm or normalized.startswith(d_norm + os.sep):
+            return True
+    return False
 
 # Set by the UI at startup. When a tool is about to do something
 # risky (delete a file, run a destructive shell command), it calls
@@ -53,6 +98,13 @@ def _is_dangerous_command(command: str) -> bool:
 def set_project_dir(path: str):
     """Called once when the app starts, to lock the AI to one folder."""
     global PROJECT_DIR
+    if _is_dangerous_project_dir(path):
+        raise UnsafeProjectDirError(
+            f"'{path}' looks like a system folder (or a whole drive), not "
+            f"a project folder. For safety, this app won't let the AI "
+            f"operate there. Please choose (or create) a regular folder "
+            f"instead, e.g. one inside your Documents or Desktop."
+        )
     PROJECT_DIR = os.path.abspath(path)
     os.makedirs(PROJECT_DIR, exist_ok=True)
 
@@ -82,8 +134,13 @@ def read_file(path: str) -> str:
 
 
 def write_file(path: str, content: str) -> str:
-    """Create a new file, or completely overwrite an existing one."""
+    """Create a new file, or completely overwrite an existing one. Requires user confirmation first."""
     full_path = _safe_path(path)
+    action = "Overwrite" if os.path.exists(full_path) else "Create"
+    preview = content if len(content) <= 300 else content[:300] + "\n... (truncated)"
+    if not _confirm(f"{action} the file '{path}' with this content:\n\n{preview}"):
+        return f"Cancelled: the user did not approve writing to '{path}'."
+
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     with open(full_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -97,6 +154,7 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
     touches the part that needs to change, not the whole file.
     Fails loudly if old_text isn't found, or is found more than once,
     so the AI doesn't guess wrong and corrupt the file.
+    Requires user confirmation before the change is applied.
     """
     full_path = _safe_path(path)
     if not os.path.exists(full_path):
@@ -113,6 +171,17 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
             f"ERROR: the given text appears {count} times in '{path}'. "
             f"Please provide more surrounding context to make it unique."
         )
+
+    def _preview(text, limit=200):
+        return text if len(text) <= limit else text[:limit] + "... (truncated)"
+
+    description = (
+        f"Edit '{path}':\n\n"
+        f"Replace:\n{_preview(old_text)}\n\n"
+        f"With:\n{_preview(new_text)}"
+    )
+    if not _confirm(description):
+        return f"Cancelled: the user did not approve editing '{path}'."
 
     new_content = content.replace(old_text, new_text, 1)
     with open(full_path, "w", encoding="utf-8") as f:
@@ -156,15 +225,15 @@ def run_shell_command(command: str) -> str:
     Run a shell command inside the project folder (e.g. to run a script,
     install a package, or run tests). Returns combined stdout/stderr.
     Has a timeout so a stuck command can't freeze the app forever.
-    Destructive-looking commands (deleting files, force-resetting git,
-    etc.) require user confirmation before running.
+    Every command requires user confirmation before running, since this
+    can install software or change things outside of the project files.
     """
     if PROJECT_DIR is None:
         raise RuntimeError("Project directory not set yet.")
 
-    if _is_dangerous_command(command):
-        if not _confirm(f"Run this command:\n\n{command}"):
-            return "Cancelled: the user did not approve running this command."
+    warning = " (this looks like it could delete or overwrite data)" if _is_dangerous_command(command) else ""
+    if not _confirm(f"Run this command{warning}:\n\n{command}"):
+        return "Cancelled: the user did not approve running this command."
 
     try:
         result = subprocess.run(
@@ -195,7 +264,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "write_file",
-        "description": "Create a new file or completely overwrite an existing file with new content.",
+        "description": "Create a new file or completely overwrite an existing file with new content. Requires user confirmation before it happens.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -207,7 +276,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "edit_file",
-        "description": "Make a targeted change to a file by replacing an exact chunk of existing text with new text. Preferred over write_file for small changes.",
+        "description": "Make a targeted change to a file by replacing an exact chunk of existing text with new text. Preferred over write_file for small changes. Requires user confirmation before it happens.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -238,7 +307,7 @@ TOOL_SCHEMA = [
     },
     {
         "name": "run_shell_command",
-        "description": "Run a shell command inside the project folder, e.g. to run a script or install a dependency.",
+        "description": "Run a shell command inside the project folder, e.g. to run a script or install a dependency. Requires user confirmation before it happens.",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},

@@ -9,6 +9,7 @@ any time every configured provider has run out of usage for the day.
 
 import os
 import json
+import threading
 import webbrowser
 import tkinter as tk
 from tkinter import messagebox
@@ -21,7 +22,6 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 # to require billing, so it's not offered as a "free" option.)
 PROVIDER_FIELDS = [
     ("GROQ_API_KEY", "Groq", "https://console.groq.com"),
-    ("GEMINI_API_KEY", "Google Gemini", "https://aistudio.google.com/apikey"),
     ("MISTRAL_API_KEY", "Mistral", "https://console.mistral.ai"),
     ("OPENROUTER_API_KEY", "OpenRouter", "https://openrouter.ai/keys"),
 ]
@@ -111,11 +111,61 @@ class ApiKeySetupDialog(tk.Toplevel):
             tk.Label(self, text=url, font=("TkDefaultFont", 8), fg="gray").pack(anchor="w", padx=12)
 
         button_row = tk.Frame(self)
-        button_row.pack(pady=12)
+        button_row.pack(pady=(4, 8))
+        tk.Button(button_row, text="Test Keys", width=12, command=self._on_test).pack(side="left", padx=4)
         tk.Button(button_row, text="Save", width=12, command=self._on_save).pack(side="left", padx=4)
         tk.Button(button_row, text="Cancel", width=12, command=self.destroy).pack(side="left", padx=4)
 
+        self.results_label = tk.Label(self, text="", wraplength=450, justify="left", fg="#333333")
+        self.results_label.pack(padx=12, pady=(0, 8), anchor="w")
+
         self.entries[PROVIDER_FIELDS[0][0]].focus_set()
+
+    def _on_test(self):
+        # Import here (not at module top) to avoid config.py depending
+        # on providers.py before it's needed - this dialog is the only
+        # place that tests connectivity directly.
+        from providers import (
+            GroqProvider, MistralProvider, OpenRouterProvider,
+            RateLimitError, ProviderError,
+        )
+        factories = {
+            "GROQ_API_KEY": GroqProvider,
+            "MISTRAL_API_KEY": MistralProvider,
+            "OPENROUTER_API_KEY": OpenRouterProvider,
+        }
+
+        keys_to_test = {
+            env_var: entry.get().strip()
+            for env_var, entry in self.entries.items()
+            if entry.get().strip()
+        }
+        if not keys_to_test:
+            self.results_label.config(text="Enter at least one key first, then click Test Keys.", fg="#b00020")
+            return
+
+        self.results_label.config(text="Testing... this can take a few seconds per key.", fg="#555555")
+
+        def run_tests():
+            lines = []
+            for env_var, key in keys_to_test.items():
+                label = next(l for e, l, _ in PROVIDER_FIELDS if e == env_var)
+                provider = factories[env_var](api_key=key)
+                try:
+                    provider.chat([{"role": "user", "content": "Say OK"}], [])
+                    lines.append(f"✓ {label}: working")
+                except RateLimitError:
+                    lines.append(f"✓ {label}: key is valid, but rate-limited right now")
+                except ProviderError as e:
+                    lines.append(f"✗ {label}: {e}")
+                except Exception as e:
+                    lines.append(f"✗ {label}: unexpected error — {e}")
+            self.after(0, lambda: self.results_label.config(
+                text="\n".join(lines),
+                fg="#1b4332" if all("✓" in l for l in lines) else "#b00020",
+            ))
+
+        threading.Thread(target=run_tests, daemon=True).start()
 
     def _on_save(self):
         keys = {env_var: entry.get().strip() for env_var, entry in self.entries.items()}

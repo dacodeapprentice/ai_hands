@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import scrolledtext, filedialog, messagebox
 
 from providers import (
-    GroqProvider, GeminiProvider, MistralProvider,
+    GroqProvider, MistralProvider,
     OpenRouterProvider, OllamaProvider, ModelRouter, ProviderError,
 )
 import hardware
@@ -74,8 +74,13 @@ class App:
         change_keys_btn = tk.Button(top_frame, text="API Keys", command=self._open_key_setup)
         change_keys_btn.pack(side="right")
 
-        self.output_box = scrolledtext.ScrolledText(self.root, wrap="word", state="disabled")
+        self.output_box = scrolledtext.ScrolledText(self.root, wrap="word")
         self.output_box.pack(fill="both", expand=True, padx=8, pady=4)
+        # Left in "normal" state on purpose so text can be selected and
+        # copied (Ctrl+C) normally - a "disabled" Text widget blocks
+        # selection too, not just editing. Typed edits are blocked
+        # separately below, while still allowing copy/select/navigate.
+        self.output_box.bind("<Key>", self._block_output_editing)
 
         # Message styling: AI on the left, user on the right, each with
         # its own color, plus separate styles for status/system/error lines.
@@ -166,7 +171,6 @@ class App:
             rec = hardware.recommend_model()
             candidate_providers = [
                 GroqProvider(),
-                GeminiProvider(),
                 MistralProvider(),
                 OpenRouterProvider(),
                 OllamaProvider(model=rec["model_tag"]),
@@ -178,6 +182,12 @@ class App:
             self.agent = Agent(router, project_dir=folder, on_step=self._queue_status)
             self._log(f"Ready. Working in: {folder}", "system")
             self._log(f"Active AI providers (in fallback order):\n{router.status()}", "system")
+        except tools.UnsafeProjectDirError as e:
+            self.agent = None
+            self.project_dir = None
+            self.folder_label.config(text="No folder selected")
+            self._log(str(e), "error")
+            self.root.after(50, self._prompt_for_project_folder)
         except checkpoints.GitNotFoundError as e:
             self.agent = None
             self._log(str(e), "error")
@@ -232,9 +242,9 @@ class App:
             if "hit their limits" in str(e):
                 self.update_queue.put(("providers_exhausted", (str(e), instruction)))
             else:
-                self.update_queue.put(("error", str(e)))
+                self.update_queue.put(("error", (str(e), instruction)))
         except Exception as e:
-            self.update_queue.put(("error", str(e)))
+            self.update_queue.put(("error", (str(e), instruction)))
 
     def _on_undo(self):
         if self.agent is None:
@@ -287,7 +297,13 @@ class App:
                     self._log(payload, "ai")
                     self.send_btn.config(state="normal")
                 elif kind == "error":
-                    self._log(payload, "error")
+                    error_text, failed_instruction = payload
+                    self._log(
+                        f"{error_text}\nYour message has been put back in the box below — just click Send to try again.",
+                        "error",
+                    )
+                    self.input_box.delete("1.0", "end")
+                    self.input_box.insert("1.0", failed_instruction)
                     self.send_btn.config(state="normal")
                 elif kind == "providers_exhausted":
                     error_text, failed_instruction = payload
@@ -306,10 +322,25 @@ class App:
         self.root.after(100, self._poll_queue)
 
     def _log(self, text, tag):
-        self.output_box.config(state="normal")
         self.output_box.insert("end", text + "\n\n", tag)
         self.output_box.see("end")
-        self.output_box.config(state="disabled")
+
+    def _block_output_editing(self, event):
+        """
+        Lets the output box stay selectable/copyable (state stays
+        "normal") while still preventing the user from actually typing
+        into it. Allows copy (Ctrl+C), select-all (Ctrl+A), and normal
+        navigation/scrolling keys through; blocks everything else that
+        would modify the text.
+        """
+        ctrl_held = bool(event.state & 0x0004)
+        if ctrl_held and event.keysym.lower() in ("c", "a", "insert"):
+            return None  # allow copy / select-all
+        if event.keysym in (
+            "Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End", "Tab"
+        ):
+            return None  # allow navigation/scrolling
+        return "break"  # block any actual typing/editing
 
 
 if __name__ == "__main__":
