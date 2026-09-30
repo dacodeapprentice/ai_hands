@@ -90,6 +90,24 @@ AI will be allowed to work in (its "block of clay").
 
 ## Notes for this draft
 
+- **No more retyping `$env:` every session:** if a `.env` file exists
+  in the folder you run `python main.py` from, its keys load
+  automatically at startup. Create it once (a plain text file named
+  exactly `.env`, no other extension) with lines like:
+  ```
+  GROQ_API_KEY=your_key_here
+  MISTRAL_API_KEY=your_key_here
+  ```
+  Saving keys through the "API Keys" window also writes/updates this
+  same file automatically, so however you set a key — typing `$env:`,
+  editing `.env` directly, or using the window — everything stays in
+  sync.
+
+- Every red error message now includes a short plain-language guess at
+  what went wrong, followed by the full technical stack trace — all of
+  it is selectable/copyable, so if something breaks and you're not
+  sure what it means, just copy the whole error and paste it here.
+
 - The app refuses to work directly on system folders (like `C:\Windows`,
   `C:\Program Files`, or a whole drive root) — pick a regular project
   folder, e.g. inside Documents or Desktop.
